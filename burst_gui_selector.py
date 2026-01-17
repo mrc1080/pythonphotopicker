@@ -31,7 +31,6 @@ APP_VERSION = "1.0.0"
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
 UPDATE_JSON_URL = "https://raw.githubusercontent.com/mrc1080/pythonphotopicker/main/update.json"
 
-
 # ------------------ Supported files ------------------
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
