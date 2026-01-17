@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# App data/output
+_REVIEW_FLAGGED/
+
+# OS junk
+Thumbs.db
+.DS_Store
+/.venv
+/build
+/dist
