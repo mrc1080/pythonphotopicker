@@ -25,7 +25,7 @@ import imagehash
 # App metadata / update URL
 # =========================
 APP_NAME = "Photo Picker"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 # Optional: host a tiny JSON file somewhere (GitHub raw is fine) like:
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
@@ -465,6 +465,7 @@ class BurstSelectorApp(tk.Tk):
         self.keep_default = tk.IntVar(value=2)
         self.auto_move_on_next = tk.BooleanVar(value=True)
         self.confirm_move_on_next = tk.BooleanVar(value=True)
+        self.auto_update_on_launch = tk.BooleanVar(value=True)
 
         # theme
         self.theme_var = tk.StringVar(value="light")  # light / dark
@@ -531,6 +532,10 @@ class BurstSelectorApp(tk.Tk):
 
         self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        
+        # Auto-check for updates once per day, after UI is ready
+        self.after(800, self._auto_check_updates_on_launch)
+   
 
     # ---------- settings load/save ----------
     def _apply_loaded_settings(self):
@@ -542,10 +547,17 @@ class BurstSelectorApp(tk.Tk):
             self.keep_default.set(int(prefs.get("keep_default", 2)))
             self.auto_move_on_next.set(bool(prefs.get("auto_move_on_next", True)))
             self.confirm_move_on_next.set(bool(prefs.get("confirm_move_on_next", True)))
+            self.auto_update_on_launch.set(bool(prefs.get("auto_update_on_launch", True)))
+            self._last_update_check = str(self._settings.get("last_update_check", ""))
 
         theme = self._settings.get("theme", "light")
         if theme in ("light", "dark"):
             self.theme_var.set(theme)
+        
+        # auto-update check bookkeeping
+        self._last_update_check = str(self._settings.get("last_update_check", ""))
+        self._auto_update_enabled = bool(self._settings.get("auto_update_on_launch", True))
+
 
     def _persist_settings(self):
         self._settings["theme"] = self.theme_var.get()
@@ -556,7 +568,11 @@ class BurstSelectorApp(tk.Tk):
             "keep_default": int(self.keep_default.get()),
             "auto_move_on_next": bool(self.auto_move_on_next.get()),
             "confirm_move_on_next": bool(self.confirm_move_on_next.get()),
+            "auto_update_on_launch": bool(self.auto_update_on_launch.get()),
         }
+        self._settings["auto_update_on_launch"] = bool(getattr(self, "_auto_update_enabled", True))
+        self._settings["last_update_check"] = str(getattr(self, "_last_update_check", ""))
+
         save_app_settings(self._settings)
 
     def _recent_folders(self) -> list[str]:
@@ -795,6 +811,10 @@ class BurstSelectorApp(tk.Tk):
         row6 = ttk.Frame(wrap, style="Card.TFrame")
         row6.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(row6, text="Ask before moving extras", variable=self.confirm_move_on_next, style="Card.TCheckbutton").pack(anchor="w")
+
+        row7 = ttk.Frame(wrap, style="Card.TFrame")
+        row7.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(row7, text="Check for updates automatically on launch", variable=self.auto_update_on_launch, style="Card.TCheckbutton").pack(anchor="w")
 
         btns = ttk.Frame(wrap, style="Card.TFrame")
         btns.pack(fill=tk.X, pady=(14, 0))
@@ -1652,6 +1672,30 @@ class BurstSelectorApp(tk.Tk):
     # =================
     # Updates (simple, safe)
     # =================
+    def _today_key(self) -> str:
+        # local date string like "2026-01-17"
+        return datetime.now().strftime("%Y-%m-%d")
+
+    def _should_auto_check_updates(self) -> bool:
+        if not UPDATE_JSON_URL.strip():
+            return False
+        if not self.auto_update_on_launch.get():
+            return False
+        last = getattr(self, "_last_update_check", "")
+        return last != self._today_key()
+    
+    def _auto_check_updates_on_launch(self):
+        if not self._should_auto_check_updates():
+            return
+
+        # mark as checked (so we don’t spam if offline)
+        self._last_update_check = self._today_key()
+        self._persist_settings()
+
+        # silent background check; only notify if an update is actually available
+        t = threading.Thread(target=self._check_updates_worker_silent, daemon=True)
+        t.start()
+
     def check_for_updates(self):
         if not UPDATE_JSON_URL.strip():
             messagebox.showinfo(
@@ -1696,7 +1740,7 @@ class BurstSelectorApp(tk.Tk):
                 return
 
             def ask_download():
-                ok = messagebox.askyesno("Update available", msg + "\n\nDownload update now?")
+                ok = messagebox.askyesno("Update available", msg + "\n\nDownload update now? (The app will close and reopen.)")
                 if ok:
                     self._download_update(url, latest)
 
@@ -1706,6 +1750,42 @@ class BurstSelectorApp(tk.Tk):
             self._ui(messagebox.showerror, "Updates", f"Could not check for updates:\n\n{e}")
             self._ui(lambda: self.toast_var.set("Update check failed."))
 
+    def _check_updates_worker_silent(self):
+        try:
+            with urllib.request.urlopen(UPDATE_JSON_URL, timeout=8) as resp:
+                data = resp.read().decode("utf-8", errors="replace")
+            info = json.loads(data)
+
+            latest = str(info.get("version", "")).strip()
+            notes = str(info.get("notes", "")).strip()
+            url = str(info.get("download_url", "")).strip()
+
+            if not latest:
+                return  # silent
+
+            if parse_version(latest) <= parse_version(APP_VERSION):
+                return  # up to date; silent
+
+            msg = f"Update available!\n\nInstalled: {APP_VERSION}\nLatest: {latest}"
+            if notes:
+                msg += f"\n\nWhat’s new:\n{notes}"
+            if not url:
+                msg += "\n\n(No download link provided.)"
+
+            def prompt():
+                ok = messagebox.askyesno(
+                    "Update available",
+                    msg + "\n\nDownload and install now? (The app will close and reopen.)"
+                )
+                if ok and url:
+                    self._download_update(url, latest)
+
+            self._ui(prompt)
+
+        except Exception:
+            # silent on launch
+            return
+
     def _download_update(self, url: str, latest: str):
         self.toast_var.set("Downloading update…")
         t = threading.Thread(target=self._download_update_worker, args=(url, latest), daemon=True)
@@ -1714,30 +1794,108 @@ class BurstSelectorApp(tk.Tk):
     def _download_update_worker(self, url: str, latest: str):
         try:
             base = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
-            target = base / f"{APP_NAME.replace(' ', '')}_{latest}_NEW.exe"
 
-            with urllib.request.urlopen(url, timeout=20) as resp:
-                data = resp.read()
+            # Always download to a consistent "NEW" filename
+            new_exe = base / f"{APP_NAME.replace(' ', '')}_NEW.exe"
 
-            target.write_bytes(data)
+            # Stream download to avoid huge memory spikes
+            self._ui(lambda: self.toast_var.set("Downloading update…"))
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                with open(new_exe, "wb") as f:
+                    while True:
+                        chunk = resp.read(1024 * 256)
+                        if not chunk:
+                            break
+                        f.write(chunk)
 
-            msg = (
-                "Downloaded the new version.\n\n"
-                f"Saved as:\n{target}\n\n"
-                "For safety, this app will NOT replace itself while running.\n"
-                "Close the app, then run the NEW exe."
-            )
-            self._ui(messagebox.showinfo, "Update downloaded", msg)
-            self._ui(lambda: self.toast_var.set("Update downloaded (close app to install)."))
+            def prompt_install():
+                ok = messagebox.askyesno(
+                    "Update downloaded",
+                    f"Version {latest} has been downloaded.\n\n"
+                    "Install it now? (The app will close and reopen.)"
+                )
+                if ok:
+                    self._launch_apply_update_script_and_quit(base, new_exe, APP_VERSION)
+                else:
+                    # If they say no, leave NEW file in place but tell them where it is.
+                    messagebox.showinfo("Update ready", f"Saved as:\n{new_exe}\n\nRun it anytime, or install next time.")
+                    self.toast_var.set("Update downloaded (not installed).")
 
-            try:
-                os.startfile(str(base))
-            except Exception:
-                pass
+            self._ui(prompt_install)
 
         except Exception as e:
             self._ui(messagebox.showerror, "Update download failed", str(e))
             self._ui(lambda: self.toast_var.set("Update download failed."))
+
+    def _launch_apply_update_script_and_quit(self, base: Path, new_exe: Path, old_version: str):
+        """
+        Creates and runs a small .cmd script that replaces the current EXE after this app exits,
+        keeps a backup, then relaunches the updated app.
+        """
+        # If running from source, don't try to self-replace.
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Update downloaded",
+                f"Downloaded:\n{new_exe}\n\n"
+                "You're running from source (.py), so automatic EXE replacement is skipped."
+            )
+            return
+
+        current_exe = Path(sys.executable).resolve()
+        target_exe = current_exe  # The file we want to replace in-place
+        backup_exe = base / f"{APP_NAME.replace(' ', '')}_old_{old_version}.exe"
+
+        script_path = base / "apply_update.cmd"
+
+        # CMD is the safest “no policy issues” choice.
+        # It waits until PhotoPicker.exe is not running, then swaps files and relaunches.
+        cmd = f"""@echo off
+        setlocal enableextensions
+
+        set "TARGET={str(target_exe)}"
+        set "NEW={str(new_exe)}"
+        set "BACKUP={str(backup_exe)}"
+
+        echo Applying update...
+        echo TARGET: %TARGET%
+        echo NEW:    %NEW%
+        echo BACKUP: %BACKUP%
+
+        :: Wait for the target exe to be fully released (up to ~30s)
+        for /L %%i in (1,1,60) do (
+        2>nul (>>"%TARGET%" echo.) && (del "%TARGET%" >nul 2>&1) && goto :READY
+        timeout /t 1 /nobreak >nul
+        )
+        :READY
+
+        :: If target exists, move it to backup (best-effort)
+        if exist "%TARGET%" (
+            del "%BACKUP%" >nul 2>&1
+        move /y "%TARGET%" "%BACKUP%" >nul 2>&1
+        )
+
+        :: Move new into place
+        move /y "%NEW%" "%TARGET%" >nul 2>&1
+
+        :: Relaunch updated app
+        start "" "%TARGET%"
+
+        :: Clean up this script (self-delete)
+        del "%~f0" >nul 2>&1
+        endlocal
+        """
+
+        script_path.write_text(cmd, encoding="utf-8")
+
+        # Launch script, then quit this app so files can be swapped
+        try:
+            import subprocess
+            subprocess.Popen(["cmd.exe", "/c", str(script_path)], cwd=str(base))
+        except Exception as e:
+            messagebox.showerror("Update install failed", f"Couldn't start installer script:\n\n{e}")
+            return
+
+        self.destroy()
 
     # =================
     # Close
