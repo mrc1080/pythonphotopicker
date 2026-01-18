@@ -25,7 +25,7 @@ import imagehash
 # App metadata / update URL
 # =========================
 APP_NAME = "Photo Picker"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # Optional: host a tiny JSON file somewhere (GitHub raw is fine) like:
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
@@ -168,11 +168,27 @@ def resize_max_dim(bgr: np.ndarray, max_dim: int) -> np.ndarray:
 
 
 # ------------------ Scoring ------------------
-def detect_largest_face(gray: np.ndarray, min_face: int) -> tuple[int, int, int, int] | None:
+_FACE_CASCADE = None
+
+def _get_face_cascade():
+    global _FACE_CASCADE
+    if _FACE_CASCADE is not None:
+        return _FACE_CASCADE
     try:
         cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        face_cascade = cv2.CascadeClassifier(cascade_path)
-        if face_cascade.empty():
+        c = cv2.CascadeClassifier(cascade_path)
+        if c.empty():
+            _FACE_CASCADE = None
+        else:
+            _FACE_CASCADE = c
+    except Exception:
+        _FACE_CASCADE = None
+    return _FACE_CASCADE
+    
+def detect_largest_face(gray: np.ndarray, min_face: int) -> tuple[int, int, int, int] | None:
+    try:
+        face_cascade = _get_face_cascade()
+        if face_cascade is None:
             return None
         faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(min_face, min_face))
         if len(faces) == 0:
@@ -442,13 +458,14 @@ class BurstSelectorApp(tk.Tk):
         self.current_preview_path: Path | None = None
         self.rotation_store = RotationOverrides(None)
         self.undo_stack: list[dict] = []
-
+ 
         # preferences (stored in app settings)
         self.include_subfolders = tk.BooleanVar(value=True)
         self.photos_within_seconds = tk.IntVar(value=30)
         self.duplicate_strictness = tk.DoubleVar(value=0.88)  # LOWER = more aggressive
         self.keep_default = tk.IntVar(value=2)
         self.auto_move_on_next = tk.BooleanVar(value=True)
+        self.confirm_move_on_next = tk.BooleanVar(value=True)
 
         # theme
         self.theme_var = tk.StringVar(value="light")  # light / dark
@@ -474,6 +491,7 @@ class BurstSelectorApp(tk.Tk):
 
         # ui vars
         self.status_var = tk.StringVar(value="File → Open Folder… then Start.")
+        self.keep_count_var = tk.StringVar(value="")
         self.toast_var = tk.StringVar(value="")
         self.phase_var = tk.StringVar(value="")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -524,11 +542,12 @@ class BurstSelectorApp(tk.Tk):
             self.duplicate_strictness.set(float(prefs.get("duplicate_strictness", 0.88)))
             self.keep_default.set(int(prefs.get("keep_default", 2)))
             self.auto_move_on_next.set(bool(prefs.get("auto_move_on_next", True)))
+            self.confirm_move_on_next.set(bool(prefs.get("confirm_move_on_next", True)))
 
         theme = self._settings.get("theme", "light")
         if theme in ("light", "dark"):
             self.theme_var.set(theme)
-
+        
     def _persist_settings(self):
         self._settings["theme"] = self.theme_var.get()
         self._settings["preferences"] = {
@@ -537,6 +556,7 @@ class BurstSelectorApp(tk.Tk):
             "duplicate_strictness": float(self.duplicate_strictness.get()),
             "keep_default": int(self.keep_default.get()),
             "auto_move_on_next": bool(self.auto_move_on_next.get()),
+            "confirm_move_on_next": bool(self.confirm_move_on_next.get()),
         }
         save_app_settings(self._settings)
 
@@ -761,7 +781,11 @@ class BurstSelectorApp(tk.Tk):
         row5 = ttk.Frame(wrap)
         row5.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(row5, text="Auto-move extras when you click Next", variable=self.auto_move_on_next).pack(anchor="w")
-
+        
+        row6 = ttk.Frame(wrap)
+        row6.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(row6, text="Ask before moving extras", variable=self.confirm_move_on_next).pack(anchor="w")
+        
         btns = ttk.Frame(wrap)
         btns.pack(fill=tk.X, pady=(14, 0))
 
@@ -823,7 +847,8 @@ class BurstSelectorApp(tk.Tk):
         hdr = ttk.Frame(left_card, style="Card.TFrame")
         hdr.pack(fill=tk.X)
         ttk.Label(hdr, text="Burst group photos", font=("Segoe UI", 10, "bold"), style="Card.TLabel").pack(side=tk.LEFT)
-
+        ttk.Label(hdr, textvariable=self.keep_count_var, style="Card.TLabel", foreground=self._muted).pack(side=tk.RIGHT)
+        
         self.thumb_canvas = tk.Canvas(left_card, highlightthickness=0, bg=self._card_bg)
         self.thumb_scroll = ttk.Scrollbar(left_card, orient="vertical", command=self.thumb_canvas.yview)
         self.thumb_canvas.configure(yscrollcommand=self.thumb_scroll.set)
@@ -1157,6 +1182,13 @@ class BurstSelectorApp(tk.Tk):
 
             img_lbl = ttk.Label(tile, image=img_tk, style="Card.TLabel")
             img_lbl.pack(side=tk.TOP)
+            
+        if is_missing:
+            # add a subtle label
+            ttk.Label(tile, text="Moved / missing", foreground=self._muted, style="Card.TLabel").pack(side=tk.TOP, pady=(4, 0))
+        else:
+            img_lbl.bind("<Button-1>", lambda e, p=it.path: self._set_preview(p))
+            tile.bind("<Button-1>", lambda e, p=it.path: self._set_preview(p))
 
             keep_var = tk.BooleanVar(value=(it.path in self.keep_selected))
             self._thumb_cell_vars[it.path] = keep_var
@@ -1168,6 +1200,7 @@ class BurstSelectorApp(tk.Tk):
 
             img_lbl.bind("<Button-1>", lambda e, p=it.path: self._set_preview(p))
             tile.bind("<Button-1>", lambda e, p=it.path: self._set_preview(p))
+            img_lbl.bind("<Double-Button-1>", lambda e, p=it.path: self._toggle_keep_from_tile(p))
 
             tile.pack_forget()
 
@@ -1178,6 +1211,7 @@ class BurstSelectorApp(tk.Tk):
         self._set_preview(default_preview)
 
         self.thumb_canvas.yview_moveto(0.0)
+        self._update_keep_count()
 
     def _reflow_tiles(self):
         children = list(self.thumb_frame.winfo_children())
@@ -1197,9 +1231,27 @@ class BurstSelectorApp(tk.Tk):
         for c in range(cols):
             self.thumb_frame.grid_columnconfigure(c, weight=1)
 
+    def _update_keep_count(self):
+        if not self.groups:
+            self.keep_count_var.set("")
+            return
+        g = self.groups[self.group_index]
+        kept = sum(1 for it in g if it.path in self.keep_selected)
+        self.keep_count_var.set(f"Kept: {kept}/{len(g)}")
+        
     # =================
     # Keep selection
     # =================
+    def _toggle_keep_from_tile(self, path: Path):
+        new_val = path not in self.keep_selected
+        self._set_keep(path, new_val)
+        v = self._thumb_cell_vars.get(path)
+        if v is not None:
+            v.set(new_val)
+        if self.current_preview_path == path:
+            self.keep_this_var.set(new_val)
+        self.toast_var.set("Kept" if new_val else "Un-kept")
+
     def _set_keep(self, path: Path, keep: bool):
         if keep:
             self.keep_selected.add(path)
@@ -1235,6 +1287,7 @@ class BurstSelectorApp(tk.Tk):
         self.toast_var.set(f"Picked the best {k} photo(s). You can change Keep checkboxes.")
         if self.current_preview_path:
             self.keep_this_var.set(self.current_preview_path in self.keep_selected)
+            self._update_keep_count()
 
     # =================
     # Preview (zoom/pan)
@@ -1310,15 +1363,48 @@ class BurstSelectorApp(tk.Tk):
         self._schedule_render()
 
     def _on_preview_wheel(self, event):
-        if event.num == 4:
-            self.zoom_step(1.15)
-        elif event.num == 5:
-            self.zoom_step(1/1.15)
-        else:
-            if event.delta > 0:
-                self.zoom_step(1.15)
-            else:
-                self.zoom_step(1/1.15)
+        if self._preview_base_pil is None:
+            return
+
+        old_zoom = self._zoom
+        factor = 1.15 if (event.num == 4 or getattr(event, "delta", 0) > 0) else (1/1.15)
+        new_zoom = max(0.05, min(old_zoom * factor, 8.0))
+        if abs(new_zoom - old_zoom) < 1e-6:
+            return
+
+        # compute rotated image size
+        img = self._preview_base_pil
+        if self._preview_rotation_deg % 360 != 0:
+            img = img.rotate(self._preview_rotation_deg, expand=True)
+        iw, ih = img.size
+
+        cw = max(1, self.preview_canvas.winfo_width())
+        ch = max(1, self.preview_canvas.winfo_height())
+
+        old_w, old_h = int(iw * old_zoom), int(ih * old_zoom)
+        new_w, new_h = int(iw * new_zoom), int(ih * new_zoom)
+
+        old_x0 = (cw - old_w) // 2 + self._pan_x
+        old_y0 = (ch - old_h) // 2 + self._pan_y
+
+        # cursor position relative to image
+        cx, cy = event.x, event.y
+        rx = (cx - old_x0) / max(1, old_w)
+        ry = (cy - old_y0) / max(1, old_h)
+
+        # new top-left so same relative point stays under cursor
+        new_x0 = cx - int(rx * new_w)
+        new_y0 = cy - int(ry * new_h)
+
+        # convert to pan offsets (relative to centered placement)
+        base_x0 = (cw - new_w) // 2
+        base_y0 = (ch - new_h) // 2
+        self._pan_x = new_x0 - base_x0
+        self._pan_y = new_y0 - base_y0
+
+        self._zoom = new_zoom
+        self._schedule_render()
+
 
     def _on_preview_press(self, event):
         self._drag_start = (event.x, event.y)
@@ -1467,11 +1553,22 @@ class BurstSelectorApp(tk.Tk):
             return
 
         if self.auto_move_on_next.get():
-            moved = self._auto_move_extras_current_group()
-            if moved > 0:
-                self.toast_var.set(f"Moved {moved} extra photo(s) to Extras. (Undo is available.)")
+            do_move = True
+            if self.confirm_move_on_next.get():
+                rejects = self._rejects_for_current_group()
+                do_move = messagebox.askyesno(
+                    "Move extras?",
+                    f"This will move {len(rejects)} photo(s) to:\n{self._extras_dest()}\n\n"
+                    "You can Undo afterwards.\n\nMove now?"
+                )
+            if do_move:
+                moved = self._auto_move_extras_current_group()
+                if moved > 0:
+                    self.toast_var.set(f"Moved {moved} extra photo(s) to Extras. (Undo is available.)")
+                else:
+                    self.toast_var.set("Nothing moved for this group.")
             else:
-                self.toast_var.set("Nothing moved for this group.")
+                self.toast_var.set("Move cancelled.")
 
         if self.group_index >= len(self.groups) - 1:
             self.status_var.set("All done ✅")
@@ -1497,7 +1594,8 @@ class BurstSelectorApp(tk.Tk):
             return
 
         last = self.undo_stack.pop()
-        moves: list[tuple[Path, Path]] = last["moves"]
+        moves: list[tuple[Path, Path]] = last.get("moves", [])
+        target_group = int(last.get("group_index", self.group_index))
 
         restored = 0
         for original_src, dest_actual in reversed(moves):
@@ -1508,7 +1606,8 @@ class BurstSelectorApp(tk.Tk):
         self.toast_var.set(f"Undo complete: restored {restored} photo(s).")
         messagebox.showinfo("Undo complete", f"Restored {restored} photo(s).")
 
-        self._show_group(self.group_index)
+        # show the group that was actually affected
+        self._show_group(target_group)
 
     # =================
     # Updates (simple, safe)
