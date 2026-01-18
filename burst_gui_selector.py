@@ -25,7 +25,7 @@ import imagehash
 # App metadata / update URL
 # =========================
 APP_NAME = "Photo Picker"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 
 # Optional: host a tiny JSON file somewhere (GitHub raw is fine) like:
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
@@ -1847,7 +1847,6 @@ class BurstSelectorApp(tk.Tk):
         try:
             base = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 
-            # Always download to a consistent "NEW" filename
             new_exe = base / f"{APP_NAME.replace(' ', '')}_NEW.exe"
             part = new_exe.with_suffix(".exe.part")
 
@@ -1857,9 +1856,19 @@ class BurstSelectorApp(tk.Tk):
             except Exception:
                 pass
 
-            # Stream download to avoid huge memory spikes
+            # Use a User-Agent (GitHub behaves better with one)
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": f"{APP_NAME}/{APP_VERSION} (Windows; updater)"}
+            )
+
             self._ui(lambda: self.toast_var.set("Downloading update…"))
-            with urllib.request.urlopen(url, timeout=30) as resp:
+
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                # Optional: capture headers for troubleshooting
+                content_length = resp.headers.get("Content-Length")
+                content_type = resp.headers.get("Content-Type", "")
+
                 with open(part, "wb") as f:
                     while True:
                         chunk = resp.read(1024 * 256)
@@ -1867,7 +1876,42 @@ class BurstSelectorApp(tk.Tk):
                             break
                         f.write(chunk)
 
-            # Atomic-ish finalize
+            # Basic validity checks before replacing/launching
+            size = part.stat().st_size if part.exists() else 0
+            with open(part, "rb") as f:
+                sig = f.read(2)
+
+            if sig != b"MZ" or size < 1_000_000:
+                # Likely HTML error page or truncated download
+                try:
+                    txt = part.with_suffix(".bad_download.txt")
+                    # Save first 8KB for diagnosis
+                    with open(part, "rb") as f:
+                        sample = f.read(8192)
+                    txt.write_bytes(sample)
+                except Exception:
+                    pass
+
+                try:
+                    part.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                msg = (
+                    "Downloaded file is not a valid Windows EXE.\n\n"
+                    f"URL:\n{url}\n\n"
+                    f"Content-Type: {content_type}\n"
+                    f"Content-Length: {content_length}\n"
+                    f"Downloaded size: {size}\n\n"
+                    "This usually means the download URL is wrong (asset name mismatch) "
+                    "or GitHub returned an error page.\n\n"
+                    "Fix the release asset name or update.json download_url and try again."
+                )
+                self._ui(messagebox.showerror, "Update download failed", msg)
+                self._ui(lambda: self.toast_var.set("Update download failed."))
+                return
+
+            # Finalize: rename part -> NEW exe
             try:
                 new_exe.unlink(missing_ok=True)
             except Exception:
@@ -1894,6 +1938,7 @@ class BurstSelectorApp(tk.Tk):
         except Exception as e:
             self._ui(messagebox.showerror, "Update download failed", str(e))
             self._ui(lambda: self.toast_var.set("Update download failed."))
+
 
 
     def _launch_apply_update_script_and_quit(self, base: Path, new_exe: Path, old_version: str):
