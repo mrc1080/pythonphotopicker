@@ -25,7 +25,7 @@ import imagehash
 # App metadata / update URL
 # =========================
 APP_NAME = "Photo Picker"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 # Optional: host a tiny JSON file somewhere (GitHub raw is fine) like:
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
