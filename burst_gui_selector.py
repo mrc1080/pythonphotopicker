@@ -1849,16 +1849,30 @@ class BurstSelectorApp(tk.Tk):
 
             # Always download to a consistent "NEW" filename
             new_exe = base / f"{APP_NAME.replace(' ', '')}_NEW.exe"
+            part = new_exe.with_suffix(".exe.part")
+
+            # Clean up any previous partial download
+            try:
+                part.unlink(missing_ok=True)
+            except Exception:
+                pass
 
             # Stream download to avoid huge memory spikes
             self._ui(lambda: self.toast_var.set("Downloading update…"))
             with urllib.request.urlopen(url, timeout=30) as resp:
-                with open(new_exe, "wb") as f:
+                with open(part, "wb") as f:
                     while True:
                         chunk = resp.read(1024 * 256)
                         if not chunk:
                             break
                         f.write(chunk)
+
+            # Atomic-ish finalize
+            try:
+                new_exe.unlink(missing_ok=True)
+            except Exception:
+                pass
+            part.replace(new_exe)
 
             def prompt_install():
                 ok = messagebox.askyesno(
@@ -1869,8 +1883,10 @@ class BurstSelectorApp(tk.Tk):
                 if ok:
                     self._launch_apply_update_script_and_quit(base, new_exe, APP_VERSION)
                 else:
-                    # If they say no, leave NEW file in place but tell them where it is.
-                    messagebox.showinfo("Update ready", f"Saved as:\n{new_exe}\n\nRun it anytime, or install next time.")
+                    messagebox.showinfo(
+                        "Update ready",
+                        f"Saved as:\n{new_exe}\n\nYou can install next time from Help → Check for updates."
+                    )
                     self.toast_var.set("Update downloaded (not installed).")
 
             self._ui(prompt_install)
@@ -1879,12 +1895,14 @@ class BurstSelectorApp(tk.Tk):
             self._ui(messagebox.showerror, "Update download failed", str(e))
             self._ui(lambda: self.toast_var.set("Update download failed."))
 
+
     def _launch_apply_update_script_and_quit(self, base: Path, new_exe: Path, old_version: str):
         """
-        Creates and runs a small .cmd script that replaces the current EXE after this app exits,
-        keeps a backup, then relaunches the updated app.
+        Safely swaps PhotoPicker.exe in-place after the app exits:
+          PhotoPicker.exe -> PhotoPicker_old_<version>.exe
+          PhotoPicker_NEW.exe -> PhotoPicker.exe
+        Then relaunches.
         """
-        # If running from source, don't try to self-replace.
         if not getattr(sys, "frozen", False):
             messagebox.showinfo(
                 "Update downloaded",
@@ -1894,52 +1912,70 @@ class BurstSelectorApp(tk.Tk):
             return
 
         current_exe = Path(sys.executable).resolve()
-        target_exe = current_exe  # The file we want to replace in-place
+        target_exe = current_exe
         backup_exe = base / f"{APP_NAME.replace(' ', '')}_old_{old_version}.exe"
-
         script_path = base / "apply_update.cmd"
 
-        # CMD is the safest “no policy issues” choice.
-        # It waits until PhotoPicker.exe is not running, then swaps files and relaunches.
         cmd = f"""@echo off
-        setlocal enableextensions
+    setlocal enableextensions
 
-        set "TARGET={str(target_exe)}"
-        set "NEW={str(new_exe)}"
-        set "BACKUP={str(backup_exe)}"
+    set "TARGET={str(target_exe)}"
+    set "NEW={str(new_exe)}"
+    set "BACKUP={str(backup_exe)}"
 
-        echo Applying update...
-        echo TARGET: %TARGET%
-        echo NEW:    %NEW%
-        echo BACKUP: %BACKUP%
+    echo Applying update...
+    echo TARGET: %TARGET%
+    echo NEW:    %NEW%
+    echo BACKUP: %BACKUP%
 
-        :: Wait for the target exe to be fully released (up to ~30s)
-        for /L %%i in (1,1,60) do (
-        2>nul (>>"%TARGET%" echo.) && (del "%TARGET%" >nul 2>&1) && goto :READY
-        timeout /t 1 /nobreak >nul
-        )
-        :READY
+    :: Wait for the app to fully exit by retrying the move (no file modification!)
+    set "MOVED_OLD=0"
+    for /L %%i in (1,1,60) do (
+      if not exist "%TARGET%" (
+        set "MOVED_OLD=1"
+        goto :SWAP
+      )
+      del "%BACKUP%" >nul 2>&1
+      move /y "%TARGET%" "%BACKUP%" >nul 2>&1
+      if exist "%BACKUP%" (
+        set "MOVED_OLD=1"
+        goto :SWAP
+      )
+      timeout /t 1 /nobreak >nul
+    )
 
-        :: If target exists, move it to backup (best-effort)
-        if exist "%TARGET%" (
-            del "%BACKUP%" >nul 2>&1
-        move /y "%TARGET%" "%BACKUP%" >nul 2>&1
-        )
+    :SWAP
+    if not exist "%NEW%" (
+      echo ERROR: New file missing: %NEW%
+      goto :FAIL
+    )
 
-        :: Move new into place
-        move /y "%NEW%" "%TARGET%" >nul 2>&1
+    :: If old wasn't moved (rare), try one last delete of target (best-effort)
+    if exist "%TARGET%" del "%TARGET%" >nul 2>&1
 
-        :: Relaunch updated app
-        start "" "%TARGET%"
+    move /y "%NEW%" "%TARGET%" >nul 2>&1
+    if not exist "%TARGET%" (
+      echo ERROR: Failed to move new exe into place.
+      goto :FAIL
+    )
 
-        :: Clean up this script (self-delete)
-        del "%~f0" >nul 2>&1
-        endlocal
-        """
+    start "" "%TARGET%"
+    del "%~f0" >nul 2>&1
+    endlocal
+    exit /b 0
+
+    :FAIL
+    echo.
+    echo Update failed. Your original exe may be in:
+    echo %BACKUP%
+    echo.
+    pause
+    endlocal
+    exit /b 1
+    """
 
         script_path.write_text(cmd, encoding="utf-8")
 
-        # Launch script, then quit this app so files can be swapped
         try:
             import subprocess
             subprocess.Popen(["cmd.exe", "/c", str(script_path)], cwd=str(base))
@@ -1948,6 +1984,7 @@ class BurstSelectorApp(tk.Tk):
             return
 
         self.destroy()
+
 
     # =================
     # Close
