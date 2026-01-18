@@ -25,7 +25,7 @@ import imagehash
 # App metadata / update URL
 # =========================
 APP_NAME = "Photo Picker"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 # Optional: host a tiny JSON file somewhere (GitHub raw is fine) like:
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
@@ -457,6 +457,10 @@ class BurstSelectorApp(tk.Tk):
         self.current_preview_path: Path | None = None
         self.rotation_store = RotationOverrides(None)
         self.undo_stack: list[dict] = []
+        self._review_session_id = None  # set when scan starts
+        self._moved_total = 0
+        self._groups_reviewed = 0
+
 
         # preferences (stored in app settings)
         self.include_subfolders = tk.BooleanVar(value=True)
@@ -464,6 +468,7 @@ class BurstSelectorApp(tk.Tk):
         self.duplicate_strictness = tk.DoubleVar(value=0.88)  # LOWER = more aggressive
         self.keep_default = tk.IntVar(value=2)
         self.auto_move_on_next = tk.BooleanVar(value=True)
+        self.session_subfolder_extras = tk.BooleanVar(value=True)  # put moved extras into a per-session folder
         self.confirm_move_on_next = tk.BooleanVar(value=True)
         self.auto_update_on_launch = tk.BooleanVar(value=True)
 
@@ -549,6 +554,8 @@ class BurstSelectorApp(tk.Tk):
             self.confirm_move_on_next.set(bool(prefs.get("confirm_move_on_next", True)))
             self.auto_update_on_launch.set(bool(prefs.get("auto_update_on_launch", True)))
             self._last_update_check = str(self._settings.get("last_update_check", ""))
+            self.session_subfolder_extras.set(bool(prefs.get("session_subfolder_extras", True)))
+
 
         theme = self._settings.get("theme", "light")
         if theme in ("light", "dark"):
@@ -569,6 +576,8 @@ class BurstSelectorApp(tk.Tk):
             "auto_move_on_next": bool(self.auto_move_on_next.get()),
             "confirm_move_on_next": bool(self.confirm_move_on_next.get()),
             "auto_update_on_launch": bool(self.auto_update_on_launch.get()),
+            "session_subfolder_extras": bool(self.session_subfolder_extras.get()),
+
         }
         self._settings["auto_update_on_launch"] = bool(getattr(self, "_auto_update_enabled", True))
         self._settings["last_update_check"] = str(getattr(self, "_last_update_check", ""))
@@ -815,6 +824,11 @@ class BurstSelectorApp(tk.Tk):
         row7 = ttk.Frame(wrap, style="Card.TFrame")
         row7.pack(fill=tk.X, pady=4)
         ttk.Checkbutton(row7, text="Check for updates automatically on launch", variable=self.auto_update_on_launch, style="Card.TCheckbutton").pack(anchor="w")
+
+        row8 = ttk.Frame(wrap, style="Card.TFrame")
+        row8.pack(fill=tk.X, pady=4)
+        ttk.Checkbutton(rowX, text="Put moved Extras into a dated folder (recommended)", variable=self.session_subfolder_extras, style="Card.TCheckbutton").pack(anchor="w")
+
 
         btns = ttk.Frame(wrap, style="Card.TFrame")
         btns.pack(fill=tk.X, pady=(14, 0))
@@ -1073,6 +1087,9 @@ class BurstSelectorApp(tk.Tk):
         self.toast_var.set("")
         self.phase_var.set("")
         self.progress_var.set(0.0)
+        self._review_session_id = datetime.now().strftime("%Y-%m-%d_%H%M")
+        self._moved_total = 0
+        self._groups_reviewed = 0
         t = threading.Thread(target=self._scan_worker, daemon=True)
         t.start()
 
@@ -1587,8 +1604,32 @@ class BurstSelectorApp(tk.Tk):
     # =================
     # Move extras / navigation
     # =================
+    def _show_finish_summary(self):
+        if not self.root_dir:
+            return
+
+        groups_total = len(self.groups) if self.groups else 0
+        extras_dir = self._extras_dest()
+        session = self._review_session_id or ""
+
+        msg = (
+            "Finished reviewing ✅\n\n"
+            f"Folder:\n{self.root_dir}\n\n"
+            f"Groups reviewed: {self._groups_reviewed} / {groups_total}\n"
+            f"Total moved to Extras: {self._moved_total}\n\n"
+            f"Extras location:\n{extras_dir}\n"
+        )
+
+        # Simple action dialog
+        if messagebox.askyesno("All done", msg + "\nOpen the Extras folder now?"):
+            self.open_extras_folder()
+
     def _extras_dest(self) -> Path:
-        return self.root_dir / "_REVIEW_FLAGGED" / "Extras (Duplicates)"
+        base = self.root_dir / "_REVIEW_FLAGGED" / "Extras (Duplicates)"
+        if self.session_subfolder_extras.get():
+            sid = self._review_session_id or datetime.now().strftime("%Y-%m-%d_%H%M")
+            return base / sid
+        return base
 
     def _rejects_for_current_group(self) -> list[Path]:
         g = self.groups[self.group_index]
@@ -1607,7 +1648,10 @@ class BurstSelectorApp(tk.Tk):
         moved_pairs = move_to_folder_recorded(rejects, self._extras_dest())
         if moved_pairs:
             self.undo_stack.append({"group_index": self.group_index, "moves": moved_pairs})
-        return len(moved_pairs)
+        moved_count = len(moved_pairs)
+        if moved_count:
+            self._moved_total += moved_count
+        return moved_count
 
     def next_group(self):
         if not self.groups:
@@ -1615,13 +1659,18 @@ class BurstSelectorApp(tk.Tk):
 
         if self.auto_move_on_next.get():
             do_move = True
-            if self.confirm_move_on_next.get():
+
+            is_last = (self.group_index >= len(self.groups) - 1)
+
+            # Always confirm on the last group
+            if self.confirm_move_on_next.get() or is_last:
                 rejects = self._rejects_for_current_group()
                 do_move = messagebox.askyesno(
                     "Move extras?",
                     f"This will move {len(rejects)} photo(s) to:\n{self._extras_dest()}\n\n"
                     "You can Undo afterwards.\n\nMove now?"
                 )
+
             if do_move:
                 moved = self._auto_move_extras_current_group()
                 if moved > 0:
@@ -1631,13 +1680,16 @@ class BurstSelectorApp(tk.Tk):
             else:
                 self.toast_var.set("Move cancelled.")
 
+
         if self.group_index >= len(self.groups) - 1:
             self.status_var.set("All done ✅")
             self.phase_var.set("Done")
             self.progress_var.set(100.0)
             self.toast_var.set("Finished! Use Help → Open Extras Folder if needed.")
+            self._show_finish_summary()
             return
-
+            
+        self._groups_reviewed = max(self._groups_reviewed, self.group_index + 1)
         self._show_group(self.group_index + 1)
         self.auto_select_best()
 
