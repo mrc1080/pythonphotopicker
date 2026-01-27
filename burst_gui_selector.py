@@ -7,6 +7,10 @@ import shutil
 import tempfile
 import threading
 import urllib.request
+import logging
+import time
+
+from app_logging import init_logging, safe_log_exception
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
@@ -25,7 +29,7 @@ import imagehash
 # App metadata / update URL
 # =========================
 APP_NAME = "Photo Picker"
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 # Optional: host a tiny JSON file somewhere (GitHub raw is fine) like:
 # {"version":"1.0.1","notes":"Fixes...","download_url":"https://.../PhotoPicker.exe"}
@@ -448,6 +452,9 @@ def parse_version(v: str) -> tuple[int, int, int]:
 class BurstSelectorApp(tk.Tk):
     def __init__(self):
         super().__init__()
+
+        # logging
+        self.log, self.log_path = init_logging(APP_NAME, APP_VERSION)
 
         # state
         self.root_dir: Path | None = None
@@ -1068,6 +1075,7 @@ class BurstSelectorApp(tk.Tk):
             self._set_root_dir(Path(folder))
 
     def _set_root_dir(self, folder: Path):
+        self.log.info("Root folder set: %s", str(self.root_dir))
         self.root_dir = folder.resolve()
         self.rotation_store = RotationOverrides(self.root_dir)
         self.status_var.set(f"Folder: {self.root_dir}  |  Click Start")
@@ -1081,6 +1089,11 @@ class BurstSelectorApp(tk.Tk):
     # Scan & group
     # =================
     def scan_and_group(self):
+        self.log.info("Scan starting: include_subfolders=%s within_seconds=%s sim=%s keep_default=%s",
+                bool(self.include_subfolders.get()),
+                int(self.photos_within_seconds.get()),
+                float(self.duplicate_strictness.get()),
+                int(self.keep_default.get()))
         if not self.root_dir:
             messagebox.showerror("No folder", "Choose a folder first (File → Open Folder).")
             return
@@ -1094,6 +1107,9 @@ class BurstSelectorApp(tk.Tk):
         t.start()
 
     def _scan_worker(self):
+        t0 = time.time()
+        self.log.info("Scan worker started")
+
         self._ui(self._show_overlay, "Organizing photos…")
         try:
             root = self.root_dir
@@ -1109,6 +1125,7 @@ class BurstSelectorApp(tk.Tk):
                     paths.append(p)
 
             if not paths:
+                self.log.info("No images found in folder: %s", root)
                 self._ui(lambda: self.status_var.set("No images found in that folder."))
                 self._ui(lambda: self.phase_var.set(""))
                 self._ui(lambda: self.progress_var.set(0.0))
@@ -1125,12 +1142,15 @@ class BurstSelectorApp(tk.Tk):
 
                 bgr = cv2_read_bgr(p)
                 if bgr is None:
+                    self.log.warning("Failed to read image: %s", p)
                     continue
+
                 bgr = resize_max_dim(bgr, self._max_dim)
 
                 try:
                     q = quality_score(bgr, center_crop=self._center_crop, min_face=self._min_face)
                 except Exception:
+                    self.log.exception("Quality score failed for %s", p)
                     q = -1e9
 
                 ph = None
@@ -1139,7 +1159,7 @@ class BurstSelectorApp(tk.Tk):
                     ph = phash_hex_from_bgr(bgr, hash_size=self._hash_size)
                     tg = make_thumb_gray(bgr, size=self._thumb_gray_px)
                 except Exception:
-                    pass
+                    self.log.exception("Hash/thumb generation failed for %s", p)
 
                 items.append(PhotoItem(path=p, ts=ts, phash_hex=ph, thumb_gray=tg, quality=q))
 
@@ -1156,29 +1176,13 @@ class BurstSelectorApp(tk.Tk):
             sim = float(self.duplicate_strictness.get())
             for g in time_groups:
                 groups.extend(cluster_by_similarity(g, hash_dist=self._hash_dist, sim_thresh=sim))
+
             groups.sort(key=lambda g: (-len(g), min(x.ts for x in g)))
 
-            total_thumbs = sum(len(g) for g in groups) if groups else 1
-            done = 0
-            self._ui(lambda: self.phase_var.set(f"Preparing thumbnails… (0/{total_thumbs})"))
-            self._ui(lambda: self.progress_var.set(70.0))
-
-            for g in groups:
-                for it in g:
-                    try:
-                        with Image.open(it.path) as im:
-                            im = ImageOps.exif_transpose(im)
-                            im = im.convert("RGB")
-                            im.thumbnail((self._thumb_px, self._thumb_px))
-                            it.thumb_pil = im.copy()
-                    except Exception:
-                        it.thumb_pil = Image.new("RGB", (self._thumb_px, self._thumb_px), (50, 50, 50))
-
-                    done += 1
-                    if done % 60 == 0 or done == total_thumbs:
-                        pct = 70.0 + (done / total_thumbs) * 30.0
-                        self._ui(lambda done=done, total_thumbs=total_thumbs: self.phase_var.set(f"Preparing thumbnails… ({done}/{total_thumbs})"))
-                        self._ui(lambda pct=pct: self.progress_var.set(pct))
+            self.log.info(
+                "Scan complete: images=%d groups=%d elapsed=%.2fs",
+                len(items), len(groups), time.time() - t0
+            )
 
             def apply_results():
                 self.groups = groups
@@ -1200,10 +1204,17 @@ class BurstSelectorApp(tk.Tk):
 
             self._ui(apply_results)
 
-        except Exception as e:
-            self._ui(messagebox.showerror, "Error", str(e))
+        except Exception:
+            safe_log_exception(self.log, "Scan worker failed")
+            self._ui(
+                messagebox.showerror,
+                "Error",
+                "Scan failed. See PhotoPicker.log for details."
+            )
+
         finally:
             self._ui(self._hide_overlay)
+
 
     # =================
     # Tiled thumbnails
@@ -1647,7 +1658,11 @@ class BurstSelectorApp(tk.Tk):
             return 0
         moved_pairs = move_to_folder_recorded(rejects, self._extras_dest())
         if moved_pairs:
+            self.log.info("Moved %d file(s) to Extras: %s", len(moved_pairs), str(self._extras_dest()))
+            for src, dst in moved_pairs:
+                self.log.info("MOVE %s -> %s", str(src), str(dst))
             self.undo_stack.append({"group_index": self.group_index, "moves": moved_pairs})
+            self.log.info("Undo complete: restored=%d", restored)
         moved_count = len(moved_pairs)
         if moved_count:
             self._moved_total += moved_count
@@ -1715,6 +1730,7 @@ class BurstSelectorApp(tk.Tk):
             actual = safe_restore_move(dest_actual, original_src)
             if actual is not None:
                 restored += 1
+                self.log.info("UNDO %s -> %s", str(dest_actual), str(actual))
 
         self.toast_var.set(f"Undo complete: restored {restored} photo(s).")
         messagebox.showinfo("Undo complete", f"Restored {restored} photo(s).")
@@ -1763,6 +1779,7 @@ class BurstSelectorApp(tk.Tk):
         t.start()
 
     def _check_updates_worker(self):
+        self.log.info("Manual update check started: %s", UPDATE_JSON_URL)
         try:
             with urllib.request.urlopen(UPDATE_JSON_URL, timeout=8) as resp:
                 data = resp.read().decode("utf-8", errors="replace")
@@ -1780,9 +1797,13 @@ class BurstSelectorApp(tk.Tk):
             if parse_version(latest) <= parse_version(APP_VERSION):
                 self._ui(messagebox.showinfo, "Updates", f"You're up to date.\n\nInstalled: {APP_VERSION}\nLatest: {latest}")
                 self._ui(lambda: self.toast_var.set("You're up to date."))
+                self.log.info("Update check: up to date (installed=%s latest=%s)", APP_VERSION, latest)
+
                 return
 
             msg = f"Update available!\n\nInstalled: {APP_VERSION}\nLatest: {latest}"
+            self.log.info("Update available: installed=%s latest=%s url=%s", APP_VERSION, latest, url)
+
             if notes:
                 msg += f"\n\nWhat’s new:\n{notes}"
             if not url:
@@ -1844,6 +1865,8 @@ class BurstSelectorApp(tk.Tk):
         t.start()
 
     def _download_update_worker(self, url: str, latest: str):
+        self.log.info("Downloading update: latest=%s url=%s", latest, url)
+
         try:
             base = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 
@@ -1909,6 +1932,9 @@ class BurstSelectorApp(tk.Tk):
                 )
                 self._ui(messagebox.showerror, "Update download failed", msg)
                 self._ui(lambda: self.toast_var.set("Update download failed."))
+                self.log.error("Downloaded update invalid: content_type=%s content_length=%s size=%d",
+                            content_type, content_length, size)
+
                 return
 
             # Finalize: rename part -> NEW exe
@@ -1926,6 +1952,8 @@ class BurstSelectorApp(tk.Tk):
                 )
                 if ok:
                     self._launch_apply_update_script_and_quit(base, new_exe, APP_VERSION)
+                    self.log.info("Update downloaded OK: %s", str(new_exe))
+
                 else:
                     messagebox.showinfo(
                         "Update ready",
@@ -2035,6 +2063,10 @@ class BurstSelectorApp(tk.Tk):
     # Close
     # =================
     def _on_close(self):
+        try:
+            self.log.info("App closing requested")
+        except Exception:
+            pass
         self._persist_settings()
         self.destroy()
 
