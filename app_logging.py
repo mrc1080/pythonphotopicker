@@ -12,9 +12,9 @@ from pathlib import Path
 def _log_dir(app_name_no_spaces: str) -> Path:
     base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
     if base:
-        return Path(base) / app_name_no_sapces / "logs"
+        return Path(base) / app_name_no_spaces / "logs"
     # fallback for non-windows / dev
-    return Path.home() / f".{app_name_no_sapces.lower()}" / "logs"
+    return Path.home() / f".{app_name_no_spaces.lower()}" / "logs"
     
     
 def init_logging(app_name: str, app_version: str) -> tuple[logging.Logger, Path]:
